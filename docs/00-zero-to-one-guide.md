@@ -370,6 +370,99 @@ Together they solve both problems:
 - `splice()` moves a node to the front without copying the node.
 - The back node is always the LRU victim when capacity is full.
 
+### The rule that keeps the structures correct
+
+Every live key must appear **once in both structures**:
+
+```text
+map_[key]  -> iterator to the one usage_list_ node whose first field is key
+```
+
+For example, after the earlier `SET d 4`, the cache has this relationship:
+
+```text
+map_                              usage_list_
+"d" -> bookmark ----------------> [d, 4] <-> [a, 1] <-> [c, 3]
+"a" -> bookmark --------------------------------^ 
+"c" -> bookmark ------------------------------------------------^
+                                    front / MRU          back / LRU
+```
+
+The arrows are conceptual: the map stores C++ list iterators, not literal arrows. The important invariant is that no key is left in only one structure. When the cache adds a key, it adds both the list node and its map entry. When it deletes a key, it removes both. This is why the methods take one mutex before changing either structure: another thread must never observe a half-finished update.
+
+### What happens on `GET`
+
+Suppose the current order is `d, a, c`, where `d` is newest and `c` is oldest. A client asks for `GET a`.
+
+1. `get()` looks up `"a"` in `map_`. This quickly produces the iterator for the existing `[a, 1]` node.
+2. It checks whether that entry's TTL has expired. If it has, `get()` erases the list node and map entry, then returns no value.
+3. If it is still live, `usage_list_.splice(usage_list_.begin(), usage_list_, list_it)` moves that **same node** to the front.
+4. The map iterator remains valid because `std::list::splice` relinks the node instead of copying or destroying it.
+5. `get()` returns the value.
+
+```text
+Before GET a:  [d, 4] <-> [a, 1] <-> [c, 3]
+After GET a:   [a, 1] <-> [d, 4] <-> [c, 3]
+                 newest                    oldest
+```
+
+This is why a successful `GET` is also a write to the LRU order. It changes which key will be evicted next, even though the stored value is unchanged. A missing or expired `GET` does not promote anything.
+
+### What happens on `SET`
+
+`set()` has two paths.
+
+#### Updating an existing key
+
+For `SET a 99`, the key is already in `map_`. The cache uses its iterator to find the existing list node, replaces that node's `CacheEntry` with the new value and TTL, then splices the node to the front. The total number of keys does not change, so no eviction is needed.
+
+```text
+Before SET a 99:  [d, 4] <-> [a, 1] <-> [c, 3]
+After SET a 99:   [a, 99] <-> [d, 4] <-> [c, 3]
+```
+
+Updating counts as using the key. In particular, replacing an existing value never evicts another key, even when the cache is at capacity.
+
+#### Inserting a new key
+
+For a new key, `set()` first checks whether the list size has reached `capacity_`.
+
+- If there is room, it inserts a `[key, entry]` node at the front and stores an iterator to that new front node in `map_`.
+- If the cache is full, it calls `evict_lru_locked()` first. That helper reads the key from the back node, erases that key from `map_`, and then erases the back node from `usage_list_`. The new key is then inserted at the front.
+
+For capacity three:
+
+```text
+Before SET e 5:  [a, 99] <-> [d, 4] <-> [c, 3]
+                                     ^ c is the LRU victim
+
+Remove c:        [a, 99] <-> [d, 4]
+Insert e:        [e, 5] <-> [a, 99] <-> [d, 4]
+```
+
+The cache removes the map entry before removing its list node because it needs that node's key to locate the corresponding map entry. After the list node is erased, its iterator must no longer be used.
+
+### What happens on deletion and expiration
+
+`DEL key` looks up the key in `map_`, erases the pointed-to list node, then erases the map entry. TTL cleanup uses the same paired deletion:
+
+- `GET` and `EXISTS` perform **lazy expiry**. If they encounter an expired entry, they remove it immediately instead of returning stale data.
+- `evict_expired()` performs **active expiry**. It periodically scans every list node, collects expired keys, and then removes each key from both structures.
+
+Expiration frees capacity. An expired key that is removed before an insertion is no longer an LRU candidate, because it is no longer in the cache at all.
+
+### Why these operations are fast
+
+| Operation | Main work | Typical complexity |
+| --- | --- | --- |
+| `GET` live key | Map lookup, TTL check, `splice` | Average O(1) |
+| `SET` existing key | Map lookup, replace entry, `splice` | Average O(1) |
+| `SET` new key at capacity | Remove list back node and matching map entry, then insert | Average O(1) |
+| `DEL` | Map lookup and erase through stored iterator | Average O(1) |
+| Background TTL sweep | Inspect every list node | O(n) |
+
+`unordered_map` operations are described as **average** O(1), rather than guaranteed O(1), because unusually bad hash collisions can make a lookup slower. The normal cache operations avoid scanning the whole list; only the periodic expiry sweep deliberately visits every entry.
+
 ## 8. What Is A Thread?
 
 A running program is a **process**. A **thread** is one path of work inside that process. A program can have multiple threads working at roughly the same time.
